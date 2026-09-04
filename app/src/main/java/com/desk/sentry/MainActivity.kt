@@ -5,12 +5,16 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.TimePickerDialog
 import android.app.admin.DevicePolicyManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Matrix
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
@@ -123,9 +127,14 @@ class MainActivity : AppCompatActivity() {
     private val preSlotReadyAnnounced = BooleanArray(6) { false }
     private var hasAnnouncedLowBattery = false
 
+    // Cloud & Snapshot Trigger
+    @Volatile private var shouldCaptureSnapshotFrame = false
+
     private lateinit var previewView: PreviewView
     private lateinit var tvLiveStatus: TextView
     private lateinit var tvCountdown: TextView
+    private lateinit var tvDeviceId: TextView
+    private lateinit var tvCloudStatus: TextView
     private lateinit var btnFlipCamera: Button
     private lateinit var btnOpenEvents: Button
     private lateinit var btnEnterStealth: Button
@@ -200,6 +209,17 @@ class MainActivity : AppCompatActivity() {
         loadAllSlots()
         updateBufferLimitUI()
         initAlarmSound()
+
+        // Firebase On-Demand Snapshot Command Listener
+        FirebaseManager.listenForSnapshotCommands(this) {
+            shouldCaptureSnapshotFrame = true
+        }
+
+        // Initial Events Sync to Firebase
+        val todayKey = getTodayDateKey()
+        FirebaseManager.syncDayEvents(this, todayKey, getDayJson(todayKey).toString())
+        val savedDates = prefs.getStringSet("event_dates_set", HashSet()) ?: HashSet()
+        FirebaseManager.syncAvailableDates(this, savedDates)
 
         previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
 
@@ -405,6 +425,8 @@ class MainActivity : AppCompatActivity() {
         previewView = findViewById(R.id.previewView)
         tvLiveStatus = findViewById(R.id.tvLiveStatus)
         tvCountdown = findViewById(R.id.tvCountdown)
+        tvDeviceId = findViewById(R.id.tvDeviceId)
+        tvCloudStatus = findViewById(R.id.tvCloudStatus)
         btnFlipCamera = findViewById(R.id.btnFlipCamera)
         btnOpenEvents = findViewById(R.id.btnOpenEvents)
         btnEnterStealth = findViewById(R.id.btnEnterStealth)
@@ -423,6 +445,11 @@ class MainActivity : AppCompatActivity() {
         dashboardLayout = findViewById(R.id.dashboardLayout)
         tvBreakBankHeader = findViewById(R.id.tvBreakBankHeader)
 
+        // Set Device ID Badge
+        val deviceId = FirebaseManager.getOrGenerateDeviceId(this)
+        tvDeviceId.text = "ID: $deviceId"
+        tvCloudStatus.text = "● CLOUD"
+
         switchMasterSentry.isChecked = isSentryArmed
         switchAlwaysActive.isChecked = prefs.getBoolean("always_active_mode", false)
 
@@ -437,6 +464,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupListeners() {
+        tvDeviceId.setOnClickListener {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("Desk Sentry Device ID", FirebaseManager.getOrGenerateDeviceId(this))
+            clipboard.setPrimaryClip(clip)
+            Toast.makeText(this, "Device ID Copied: ${tvDeviceId.text}", Toast.LENGTH_SHORT).show()
+        }
+
         switchMasterSentry.setOnClickListener {
             val target = switchMasterSentry.isChecked
             switchMasterSentry.isChecked = !target
@@ -1029,11 +1063,6 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /**
-     * ADVANCED ANTI-CHAIR HUMAN ANATOMY FILTER:
-     * High confidence thresholds & strict anatomical vertical layering (Eyes above Nose, Nose above Shoulder).
-     * An office chair headrest/frame CANNOT fake this biological arrangement.
-     */
     private fun isRealDeskUser(pose: Pose, imgWidth: Float, imgHeight: Float): Boolean {
         val nose = pose.getPoseLandmark(PoseLandmark.NOSE)
         val leftEye = pose.getPoseLandmark(PoseLandmark.LEFT_EYE)
@@ -1046,7 +1075,6 @@ class MainActivity : AppCompatActivity() {
         val leftElbow = pose.getPoseLandmark(PoseLandmark.LEFT_ELBOW)
         val rightElbow = pose.getPoseLandmark(PoseLandmark.RIGHT_ELBOW)
 
-        // Rule 1: High-confidence Human Face with Strict Geometric Proportions
         val hasSolidNose = nose != null && nose.inFrameLikelihood >= 0.65f
         val hasSolidEye = (leftEye != null && leftEye.inFrameLikelihood >= 0.60f) || (rightEye != null && rightEye.inFrameLikelihood >= 0.60f)
         val hasSolidShoulder = (leftShoulder != null && leftShoulder.inFrameLikelihood >= 0.50f) || (rightShoulder != null && rightShoulder.inFrameLikelihood >= 0.50f)
@@ -1056,7 +1084,6 @@ class MainActivity : AppCompatActivity() {
             val eyeY = if (leftEye != null && leftEye.inFrameLikelihood >= 0.60f) leftEye.position.y else rightEye!!.position.y
             val shoulderY = if (leftShoulder != null && leftShoulder.inFrameLikelihood >= 0.50f) leftShoulder.position.y else rightShoulder!!.position.y
 
-            // Strict Vertical Order: Eye must be HIGHER than nose, and Nose must be HIGHER than shoulder!
             if (eyeY < noseY && noseY < shoulderY) {
                 if (leftShoulder != null && rightShoulder != null &&
                     leftShoulder.inFrameLikelihood >= 0.40f && rightShoulder.inFrameLikelihood >= 0.40f) {
@@ -1070,7 +1097,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Rule 2: Deep Bowed Writing Posture (Face hidden behind notebook, but human arms on desk)
         if (leftShoulder != null && rightShoulder != null &&
             leftShoulder.inFrameLikelihood >= 0.55f && rightShoulder.inFrameLikelihood >= 0.55f) {
             val span = abs(leftShoulder.position.x - rightShoulder.position.x)
@@ -1095,6 +1121,24 @@ class MainActivity : AppCompatActivity() {
         poseDetector: com.google.mlkit.vision.pose.PoseDetector,
         barcodeScanner: com.google.mlkit.vision.barcode.BarcodeScanner
     ) {
+        // ON-DEMAND RUNNING FRAME GRABBER FOR COMPANION APP
+        if (shouldCaptureSnapshotFrame) {
+            shouldCaptureSnapshotFrame = false
+            try {
+                val bmp = imageProxy.toBitmap()
+                val rot = imageProxy.imageInfo.rotationDegrees
+                val matrix = Matrix().apply { postRotate(rot.toFloat()) }
+                val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                FirebaseManager.uploadSnapshot(this@MainActivity, rotated)
+            } catch (e: Exception) {
+                mainHandler.post {
+                    previewView.bitmap?.let { b ->
+                        FirebaseManager.uploadSnapshot(this@MainActivity, b)
+                    }
+                }
+            }
+        }
+
         val mediaImage = imageProxy.image
         if (mediaImage == null) {
             imageProxy.close()
@@ -1207,12 +1251,6 @@ class MainActivity : AppCompatActivity() {
                 val now = System.currentTimeMillis()
                 val qrMissingDuration = now - lastAnchorSeenTimestamp
 
-                // =========================================================================
-                // INTELLIGENT 2-STAGE QR OCCLUSION LOGIC:
-                // 0-8s: Silent grace.
-                // 8-14s: Voice warning given; 5-6s adjustment grace granted (NO BUFFER YET).
-                // >14s: Buffer starts only if user ignored warning.
-                // =========================================================================
                 val isAnchorValid: Boolean
                 var isAdjustWarningActive = false
 
@@ -1236,9 +1274,6 @@ class MainActivity : AppCompatActivity() {
                     isAnchorValid = qrMissingDuration < 5000L
                 }
 
-                // =========================================================================
-                // IMMEDIATE "QR DETECTED" CONFIRMATION UPON SUCCESSFUL ADJUSTMENT
-                // =========================================================================
                 if (wasQrWarningActivePreviously && !isAdjustWarningActive && isAnchorValid && isPersonCurrentlyPresent) {
                     speak("QR detected.")
                     try { toneGenerator?.startTone(ToneGenerator.TONE_PROP_ACK, 250) } catch (e: Exception) { e.printStackTrace() }
@@ -1256,7 +1291,6 @@ class MainActivity : AppCompatActivity() {
                 val isFullyVerifiedAtDesk = rawVerified && (sustainedPresenceStartMs > 0L && (now - sustainedPresenceStartMs >= 1200L))
                 val awaySinceMs = if (deskLostTimestamp > 0L) now - deskLostTimestamp else 0L
 
-                // Pre-slot stand positioning diagnostics
                 if (isSentryArmed && (isPreSlotActive || isArmingGraceActive)) {
                     val currentDiag = when {
                         isFullyVerifiedAtDesk -> "VERIFIED"
@@ -1583,6 +1617,10 @@ class MainActivity : AppCompatActivity() {
         val newSet = HashSet(existingDates)
         newSet.add(dateKey)
         prefs.edit().putStringSet("event_dates_set", newSet).apply()
+
+        // Realtime Sync to Cloud for Companion App
+        FirebaseManager.syncDayEvents(this, dateKey, json.toString())
+        FirebaseManager.syncAvailableDates(this, newSet)
     }
 
     private fun incrementPresentTime(slotNum: Int, sec: Long) {
