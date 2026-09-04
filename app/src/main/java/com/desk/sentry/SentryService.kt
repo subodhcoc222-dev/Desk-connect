@@ -15,6 +15,7 @@ import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -33,6 +34,9 @@ class SentryService : Service() {
     private var bgMediaPlayer: MediaPlayer? = null
     private lateinit var audioManager: AudioManager
     private var screenReceiver: BroadcastReceiver? = null
+    private var powerReceiver: BroadcastReceiver? = null
+
+    private var heartbeatTimerTicks = 0
 
     companion object {
         const val ACTION_START = "ACTION_START"
@@ -61,9 +65,13 @@ class SentryService : Service() {
         }
 
         registerScreenLockMonitor()
+        registerPowerMonitor()
         initBackgroundAlarm()
         startForeground(NOTIFICATION_ID, buildForegroundNotification("24/7 Desk Guard Active"))
         startWatchdogLoop()
+
+        // Push immediate initial state to Firebase
+        pushLiveHeartbeat()
     }
 
     private fun registerScreenLockMonitor() {
@@ -82,6 +90,58 @@ class SentryService : Service() {
             }
         }
         registerReceiver(screenReceiver, filter)
+    }
+
+    private fun registerPowerMonitor() {
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+        }
+        powerReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val action = intent?.action ?: return
+                val isCharging = action == Intent.ACTION_POWER_CONNECTED
+                val batteryPct = getBatteryPercentage()
+
+                // Instant Cloud Push on Cable Change
+                FirebaseManager.pushHeartbeatAndPower(this@SentryService, isCharging, batteryPct)
+                
+                val detail = if (isCharging) "Charger Connected at $batteryPct%" else "Charger Unplugged at $batteryPct%"
+                FirebaseManager.logSecurityEvent(
+                    this@SentryService,
+                    if (isCharging) "CHARGER_CONNECTED" else "CHARGER_UNPLUGGED",
+                    detail
+                )
+            }
+        }
+        registerReceiver(powerReceiver, filter)
+    }
+
+    private fun checkChargingStatus(): Boolean {
+        val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val plugged = intent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
+        return plugged == BatteryManager.BATTERY_PLUGGED_AC ||
+                plugged == BatteryManager.BATTERY_PLUGGED_USB ||
+                plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS
+    }
+
+    private fun getBatteryPercentage(): Int {
+        return try {
+            val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        } catch (e: Exception) {
+            -1
+        }
+    }
+
+    private fun pushLiveHeartbeat() {
+        try {
+            val isCharging = checkChargingStatus()
+            val batteryPct = getBatteryPercentage()
+            FirebaseManager.pushHeartbeatAndPower(this, isCharging, batteryPct)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -204,6 +264,13 @@ class SentryService : Service() {
                     startActivity(intent)
                 }
 
+                // 10-Second Periodic Cloud Heartbeat for Dead Man's Switch
+                heartbeatTimerTicks++
+                if (heartbeatTimerTicks >= 10) {
+                    heartbeatTimerTicks = 0
+                    pushLiveHeartbeat()
+                }
+
                 handler.postDelayed(this, 1000)
             }
         })
@@ -248,6 +315,10 @@ class SentryService : Service() {
             if (screenReceiver != null) {
                 unregisterReceiver(screenReceiver)
                 screenReceiver = null
+            }
+            if (powerReceiver != null) {
+                unregisterReceiver(powerReceiver)
+                powerReceiver = null
             }
             if (bgMediaPlayer?.isPlaying == true) {
                 bgMediaPlayer?.stop()
