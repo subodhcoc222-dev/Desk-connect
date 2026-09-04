@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("com.google.gms.google-services")
 }
 
 android {
@@ -57,4 +58,12 @@ dependencies {
 
     // Google Play Services Tasks
     implementation("com.google.android.gms:play-services-tasks:18.1.0")
+
+    // Firebase BoM, Realtime Database & Cloud Storage
+    implementation(platform("com.google.firebase:firebase-bom:33.2.0"))
+    implementation("com.google.firebase:firebase-database")
+    implementation("com.google.firebase:firebase-storage")
+
+    // Background Coroutines
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
