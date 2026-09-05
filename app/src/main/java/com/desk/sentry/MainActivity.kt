@@ -5,11 +5,13 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.TimePickerDialog
 import android.app.admin.DevicePolicyManager
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -131,6 +133,9 @@ class MainActivity : AppCompatActivity() {
     // Cloud & Snapshot Trigger
     @Volatile private var shouldCaptureSnapshotFrame = false
 
+    // Zero-Delay Power Hardware Receiver
+    private var powerStateReceiver: BroadcastReceiver? = null
+
     private lateinit var previewView: PreviewView
     private lateinit var tvLiveStatus: TextView
     private lateinit var tvCountdown: TextView
@@ -210,6 +215,7 @@ class MainActivity : AppCompatActivity() {
         loadAllSlots()
         updateBufferLimitUI()
         initAlarmSound()
+        setupInstantPowerHardwareListener()
 
         // Firebase On-Demand Snapshot Command Listener
         FirebaseManager.listenForSnapshotCommands(this) {
@@ -221,6 +227,9 @@ class MainActivity : AppCompatActivity() {
         FirebaseManager.syncDayEvents(this, todayKey, getDayJson(todayKey).toString())
         val savedDates = prefs.getStringSet("event_dates_set", HashSet()) ?: HashSet()
         FirebaseManager.syncAvailableDates(this, savedDates)
+
+        // Instant Live Push on Launch
+        pushLiveTelemetryToFirebase()
 
         previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
 
@@ -239,6 +248,24 @@ class MainActivity : AppCompatActivity() {
         startDedicatedRadarBeepEngine()
     }
 
+    /**
+     * ZERO-DELAY HARDWARE INTERRUPT:
+     * Triggers the exact millisecond charger is connected or disconnected.
+     */
+    private fun setupInstantPowerHardwareListener() {
+        powerStateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                pushLiveTelemetryToFirebase()
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+        }
+        registerReceiver(powerStateReceiver, filter)
+    }
+
     private fun setFirebaseAlarmActive(active: Boolean) {
         try {
             val deviceId = FirebaseManager.getOrGenerateDeviceId(this)
@@ -246,6 +273,44 @@ class MainActivity : AppCompatActivity() {
                 .child(deviceId)
                 .child("alarm_active")
                 .setValue(active)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun getBatteryAndChargingInfo(): Pair<Int, Boolean> {
+        return try {
+            val batteryStatus: Intent? = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            val batteryPct = if (level >= 0 && scale > 0) ((level.toFloat() / scale.toFloat()) * 100).toInt() else -1
+
+            val status = batteryStatus?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+            Pair(batteryPct, isCharging)
+        } catch (e: Exception) {
+            Pair(-1, false)
+        }
+    }
+
+    private fun pushLiveTelemetryToFirebase() {
+        try {
+            val deviceId = FirebaseManager.getOrGenerateDeviceId(this)
+            val (batPct, isCharging) = getBatteryAndChargingInfo()
+            val now = System.currentTimeMillis()
+
+            val telemetryMap = hashMapOf<String, Any>(
+                "status" to "ONLINE",
+                "last_heartbeat" to now,
+                "is_charging" to isCharging
+            )
+            if (batPct >= 0) {
+                telemetryMap["battery_level"] = batPct
+            }
+
+            FirebaseDatabase.getInstance().getReference("desk_sentry")
+                .child(deviceId)
+                .updateChildren(telemetryMap)
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -420,6 +485,7 @@ class MainActivity : AppCompatActivity() {
         updateAdminStatusUI()
         updateBreakBankUI()
         updateBufferLimitUI()
+        pushLiveTelemetryToFirebase()
         if (allPermissionsGranted() && cameraProvider == null) startCamera()
     }
 
@@ -458,7 +524,6 @@ class MainActivity : AppCompatActivity() {
         dashboardLayout = findViewById(R.id.dashboardLayout)
         tvBreakBankHeader = findViewById(R.id.tvBreakBankHeader)
 
-        // Set Device ID Badge
         val deviceId = FirebaseManager.getOrGenerateDeviceId(this)
         tvDeviceId.text = "ID: $deviceId"
         tvCloudStatus.text = "● CLOUD"
@@ -1532,6 +1597,9 @@ class MainActivity : AppCompatActivity() {
             override fun run() {
                 prefs.edit().putLong("last_heartbeat_timestamp", System.currentTimeMillis()).apply()
 
+                // 1-SECOND LIVE CLOCK PULSE TO FIREBASE
+                pushLiveTelemetryToFirebase()
+
                 if (isArmingGraceActive) {
                     armingGraceRemainingSec--
                     if (armingGraceRemainingSec <= 0) isArmingGraceActive = false
@@ -1631,7 +1699,6 @@ class MainActivity : AppCompatActivity() {
         newSet.add(dateKey)
         prefs.edit().putStringSet("event_dates_set", newSet).apply()
 
-        // Realtime Sync to Cloud for Companion App
         FirebaseManager.syncDayEvents(this, dateKey, json.toString())
         FirebaseManager.syncAvailableDates(this, newSet)
     }
@@ -1749,6 +1816,18 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        powerStateReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) {}
+        }
+
+        try {
+            val deviceId = FirebaseManager.getOrGenerateDeviceId(this)
+            FirebaseDatabase.getInstance().getReference("desk_sentry")
+                .child(deviceId)
+                .child("status")
+                .setValue("OFFLINE")
+        } catch (e: Exception) { e.printStackTrace() }
+
         setFirebaseAlarmActive(false)
         isAudioRadarActive = false
         mediaPlayer?.release()
