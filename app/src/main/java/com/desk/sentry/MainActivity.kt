@@ -228,7 +228,7 @@ class MainActivity : AppCompatActivity() {
         val savedDates = prefs.getStringSet("event_dates_set", HashSet()) ?: HashSet()
         FirebaseManager.syncAvailableDates(this, savedDates)
 
-        // Instant Live Push on Launch
+        // Instant Live Push on Launch with alarm_active = false
         pushLiveTelemetryToFirebase()
 
         previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -248,10 +248,6 @@ class MainActivity : AppCompatActivity() {
         startDedicatedRadarBeepEngine()
     }
 
-    /**
-     * ZERO-DELAY HARDWARE INTERRUPT:
-     * Triggers the exact millisecond charger is connected or disconnected.
-     */
     private fun setupInstantPowerHardwareListener() {
         powerStateReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
@@ -293,16 +289,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Pushes complete live telemetry including alarm_active to Firebase every single second.
+     */
     private fun pushLiveTelemetryToFirebase() {
         try {
             val deviceId = FirebaseManager.getOrGenerateDeviceId(this)
             val (batPct, isCharging) = getBatteryAndChargingInfo()
             val now = System.currentTimeMillis()
+            val isAlarmRinging = (mediaPlayer?.isPlaying == true) || isAlarmCurrentlyTracking
 
             val telemetryMap = hashMapOf<String, Any>(
                 "status" to "ONLINE",
                 "last_heartbeat" to now,
-                "is_charging" to isCharging
+                "is_charging" to isCharging,
+                "alarm_active" to isAlarmRinging
             )
             if (batPct >= 0) {
                 telemetryMap["battery_level"] = batPct
@@ -1597,7 +1598,7 @@ class MainActivity : AppCompatActivity() {
             override fun run() {
                 prefs.edit().putLong("last_heartbeat_timestamp", System.currentTimeMillis()).apply()
 
-                // 1-SECOND LIVE CLOCK PULSE TO FIREBASE
+                // 1-SECOND LIVE CLOCK & ALARM STATE PULSE TO FIREBASE
                 pushLiveTelemetryToFirebase()
 
                 if (isArmingGraceActive) {
